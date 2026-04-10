@@ -78,18 +78,52 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = nn.ModuleDict(dict(
-            c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
-            c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
-            act     = NewGELU(),
-            dropout = nn.Dropout(config.resid_pdrop),
-        ))
-        m = self.mlp
-        self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
+        self.ffn_type = getattr(config, "ffn_type", "mlp")
+        self.last_aux_loss = None
+
+        if self.ffn_type == "mlp":
+            self.mlp = nn.ModuleDict(dict(
+                c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
+                c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
+                act     = NewGELU(),
+                dropout = nn.Dropout(config.resid_pdrop),
+            ))
+            self.ffn = None
+        elif self.ffn_type == "moe":
+            self.mlp = None
+            self.ffn = MoELayer(
+                n_embd=config.n_embd,
+                num_experts=config.moe_num_experts,
+                top_k=config.moe_top_k,
+                expert_hidden_mult=config.moe_expert_hidden_mult,
+                dropout=config.resid_pdrop,
+            )
+        elif self.ffn_type == "deepseek_moe":
+            self.mlp = None
+            self.ffn = DeepseekMoELayer(
+                n_embd=config.n_embd,
+                num_shared_experts=config.moe_num_shared_experts,
+                num_routed_experts=config.moe_num_experts,
+                top_k=config.moe_top_k,
+                expert_hidden_mult=config.moe_expert_hidden_mult,
+                dropout=config.resid_pdrop,
+            )
+        else:
+            raise ValueError(f"Unknown ffn_type: {self.ffn_type}")
+
+    def _forward_ffn(self, x):
+        if self.ffn_type == "mlp":
+            m = self.mlp
+            self.last_aux_loss = None
+            return m.dropout(m.c_proj(m.act(m.c_fc(x))))
+
+        y, aux_loss, _ = self.ffn(x, return_aux_loss=True)
+        self.last_aux_loss = aux_loss
+        return y
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
+        x = x + self._forward_ffn(self.ln_2(x))
         return x
 
 class GPT(nn.Module):
@@ -110,6 +144,13 @@ class GPT(nn.Module):
         C.embd_pdrop = 0.1
         C.resid_pdrop = 0.1
         C.attn_pdrop = 0.1
+        # feed-forward / MoE hyperparameters
+        C.ffn_type = 'mlp'
+        C.moe_num_experts = 4
+        C.moe_top_k = 2
+        C.moe_num_shared_experts = 1
+        C.moe_expert_hidden_mult = 4
+        C.moe_aux_loss_weight = 1e-2
         return C
 
     def __init__(self, config):
@@ -117,6 +158,8 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.block_size = config.block_size
+        self.moe_aux_loss_weight = config.moe_aux_loss_weight
+        self.last_moe_aux_loss = None
 
         type_given = config.model_type is not None
         params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
@@ -267,15 +310,24 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        moe_aux_loss = None
         for block in self.transformer.h:
             x = block(x)
+            if block.last_aux_loss is not None:
+                if moe_aux_loss is None:
+                    moe_aux_loss = block.last_aux_loss
+                else:
+                    moe_aux_loss = moe_aux_loss + block.last_aux_loss
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
+        self.last_moe_aux_loss = moe_aux_loss
 
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if moe_aux_loss is not None:
+                loss = loss + self.moe_aux_loss_weight * moe_aux_loss
 
         return logits, loss
 
@@ -308,3 +360,198 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+######################################
+######### NOVEL CODE BELOW HERE ######
+######################################
+
+
+class FeedForwardExpert(nn.Module):
+    """
+    A small GPT-style feed-forward expert: Linear -> GELU -> Linear -> Dropout.
+    """
+
+    def __init__(self, n_embd, hidden_mult=4, dropout=0.0):
+        super().__init__()
+        hidden_size = hidden_mult * n_embd
+        self.net = nn.ModuleDict(dict(
+            c_fc=nn.Linear(n_embd, hidden_size),
+            c_proj=nn.Linear(hidden_size, n_embd),
+            act=NewGELU(),
+            dropout=nn.Dropout(dropout),
+        ))
+
+    def forward(self, x):
+        m = self.net
+        return m.dropout(m.c_proj(m.act(m.c_fc(x))))
+
+
+class MoELayer(nn.Module):
+    """
+    A minimal top-k Mixture-of-Experts feed-forward layer.
+
+    Each token is routed to `top_k` experts. The selected experts process only
+    their assigned tokens, and their outputs are combined with the router
+    probabilities.
+    """
+
+    def __init__(
+        self,
+        n_embd,
+        num_experts,
+        top_k=2,
+        expert_hidden_mult=4,
+        dropout=0.0,
+    ):
+        super().__init__()
+        assert num_experts > 0
+        assert 1 <= top_k <= num_experts
+        self.n_embd = n_embd
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = nn.Linear(n_embd, num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            FeedForwardExpert(
+                n_embd=n_embd,
+                hidden_mult=expert_hidden_mult,
+                dropout=dropout,
+            )
+            for _ in range(num_experts)
+        ])
+
+    def _load_balancing_loss(self, router_probs, topk_indices):
+        tokens_per_expert = F.one_hot(topk_indices[:, 0], num_classes=self.num_experts).float().mean(dim=0)
+        router_prob_per_expert = router_probs.mean(dim=0)
+        return self.num_experts * torch.sum(tokens_per_expert * router_prob_per_expert)
+
+    def forward(self, x, return_aux_loss=False):
+        B, T, C = x.size()
+        x_flat = x.view(B * T, C)
+
+        router_logits = self.router(x_flat)
+        router_probs = F.softmax(router_logits, dim=-1)
+        topk_probs, topk_indices = torch.topk(router_probs, k=self.top_k, dim=-1)
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+
+        y_flat = torch.zeros_like(x_flat)
+
+        for expert_id, expert in enumerate(self.experts):
+            expert_mask = topk_indices == expert_id
+            if not expert_mask.any():
+                continue
+
+            token_positions, topk_slots = expert_mask.nonzero(as_tuple=True)
+            expert_inputs = x_flat[token_positions]
+            expert_outputs = expert(expert_inputs)
+            expert_weights = topk_probs[token_positions, topk_slots].unsqueeze(-1)
+            y_flat.index_add_(0, token_positions, expert_outputs * expert_weights)
+
+        y = y_flat.view(B, T, C)
+
+        if not return_aux_loss:
+            return y
+
+        aux_loss = self._load_balancing_loss(router_probs, topk_indices)
+        stats = {
+            "router_logits": router_logits.view(B, T, self.num_experts),
+            "router_probs": router_probs.view(B, T, self.num_experts),
+            "topk_indices": topk_indices.view(B, T, self.top_k),
+            "topk_probs": topk_probs.view(B, T, self.top_k),
+        }
+        return y, aux_loss, stats
+
+
+class DeepseekMoELayer(nn.Module):
+    """
+    A small DeepSeek-MoE-style feed-forward layer.
+
+    Shared experts are applied densely to every token. Routed experts are
+    selected sparsely with top-k routing, then added on top of the shared path.
+    """
+
+    def __init__(
+        self,
+        n_embd,
+        num_shared_experts=1,
+        num_routed_experts=4,
+        top_k=2,
+        expert_hidden_mult=4,
+        dropout=0.0,
+    ):
+        super().__init__()
+        assert num_shared_experts >= 0
+        assert num_routed_experts > 0
+        assert 1 <= top_k <= num_routed_experts
+        self.n_embd = n_embd
+        self.num_shared_experts = num_shared_experts
+        self.num_routed_experts = num_routed_experts
+        self.top_k = top_k
+
+        self.shared_experts = nn.ModuleList([
+            FeedForwardExpert(
+                n_embd=n_embd,
+                hidden_mult=expert_hidden_mult,
+                dropout=dropout,
+            )
+            for _ in range(num_shared_experts)
+        ])
+        self.router = nn.Linear(n_embd, num_routed_experts, bias=False)
+        self.routed_experts = nn.ModuleList([
+            FeedForwardExpert(
+                n_embd=n_embd,
+                hidden_mult=expert_hidden_mult,
+                dropout=dropout,
+            )
+            for _ in range(num_routed_experts)
+        ])
+
+    def _shared_path(self, x_flat):
+        if len(self.shared_experts) == 0:
+            return torch.zeros_like(x_flat)
+
+        shared_out = torch.zeros_like(x_flat)
+        for expert in self.shared_experts:
+            shared_out = shared_out + expert(x_flat)
+        return shared_out / len(self.shared_experts)
+
+    def _load_balancing_loss(self, router_probs, topk_indices):
+        tokens_per_expert = F.one_hot(topk_indices[:, 0], num_classes=self.num_routed_experts).float().mean(dim=0)
+        router_prob_per_expert = router_probs.mean(dim=0)
+        return self.num_routed_experts * torch.sum(tokens_per_expert * router_prob_per_expert)
+
+    def forward(self, x, return_aux_loss=False):
+        B, T, C = x.size()
+        x_flat = x.view(B * T, C)
+
+        shared_out = self._shared_path(x_flat)
+
+        router_logits = self.router(x_flat)
+        router_probs = F.softmax(router_logits, dim=-1)
+        topk_probs, topk_indices = torch.topk(router_probs, k=self.top_k, dim=-1)
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+
+        routed_out = torch.zeros_like(x_flat)
+        for expert_id, expert in enumerate(self.routed_experts):
+            expert_mask = topk_indices == expert_id
+            if not expert_mask.any():
+                continue
+
+            token_positions, topk_slots = expert_mask.nonzero(as_tuple=True)
+            expert_inputs = x_flat[token_positions]
+            expert_outputs = expert(expert_inputs)
+            expert_weights = topk_probs[token_positions, topk_slots].unsqueeze(-1)
+            routed_out.index_add_(0, token_positions, expert_outputs * expert_weights)
+
+        y = (shared_out + routed_out).view(B, T, C)
+
+        if not return_aux_loss:
+            return y
+
+        aux_loss = self._load_balancing_loss(router_probs, topk_indices)
+        stats = {
+            "router_logits": router_logits.view(B, T, self.num_routed_experts),
+            "router_probs": router_probs.view(B, T, self.num_routed_experts),
+            "topk_indices": topk_indices.view(B, T, self.top_k),
+            "topk_probs": topk_probs.view(B, T, self.top_k),
+        }
+        return y, aux_loss, stats
